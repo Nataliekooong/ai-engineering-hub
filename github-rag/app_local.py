@@ -1,20 +1,17 @@
-import os
-
 import gc
-import tempfile
+import re
 import uuid
-import pandas as pd
 
 from gitingest import ingest
 
-from llama_index.core import Settings
-from llama_index.llms.ollama import Ollama
-from llama_index.core import PromptTemplate
+from llama_index.core import Document, Settings, VectorStoreIndex, PromptTemplate
+from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
-from llama_index.core.node_parser import MarkdownNodeParser
+from llama_index.llms.ollama import Ollama
 
 import streamlit as st
+
+FILE_PATTERN = re.compile(r"^={20,}\nFILE: (.+?)\n={20,}\n", re.MULTILINE)
 
 if "id" not in st.session_state:
     st.session_state.id = uuid.uuid4()
@@ -23,15 +20,18 @@ if "id" not in st.session_state:
 session_id = st.session_state.id
 client = None
 
+
 @st.cache_resource
 def load_llm():
     llm = Ollama(model="llama3.2", request_timeout=120.0)
     return llm
 
+
 def reset_chat():
     st.session_state.messages = []
     st.session_state.context = None
     gc.collect()
+
 
 def process_with_gitingets(github_url):
     # or from URL
@@ -39,55 +39,77 @@ def process_with_gitingets(github_url):
     return summary, tree, content
 
 
+def split_into_files(content):
+    """Split the gitingest text dump into (file_path, file_text) pairs."""
+    matches = list(FILE_PATTERN.finditer(content))
+    files = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        text = content[start:end].strip()
+        if text:
+            files.append((m.group(1).strip(), text))
+    if not files:  # fallback if the format isn't what we expect
+        files = [("repository", content)]
+    return files
+
+
+def build_nodes(docs):
+    """Chunk each file separately. Markdown files are split by heading first."""
+    splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=100)
+    md_docs, other_docs = [], []
+    for d in docs:
+        if d.metadata["file_path"].lower().endswith((".md", ".markdown")):
+            md_docs.append(d)
+        else:
+            other_docs.append(d)
+
+    nodes = []
+    if md_docs:
+        md_nodes = MarkdownNodeParser().get_nodes_from_documents(md_docs)
+        nodes += splitter(md_nodes)  # keep heading chunks within the size limit
+    if other_docs:
+        nodes += splitter.get_nodes_from_documents(other_docs)
+    return nodes
+
+
 with st.sidebar:
     st.header(f"Add your GitHub repository!")
-    
+
     github_url = st.text_input("Enter GitHub repository URL", placeholder="GitHub URL")
     load_repo = st.button("Load Repository")
 
     if github_url and load_repo:
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                st.write("Processing your repository...")
-                repo_name = github_url.split('/')[-1]
-                file_key = f"{session_id}-{repo_name}"
-                
-                if file_key not in st.session_state.get('file_cache', {}):
+            st.write("Processing your repository...")
+            repo_name = github_url.split('/')[-1]
+            file_key = f"{session_id}-{repo_name}"
 
-                    if os.path.exists(temp_dir):
-                        summary, tree, content = process_with_gitingets(github_url)
+            if file_key not in st.session_state.get('file_cache', {}):
 
-                        # Write summary to a markdown file
-                        with open("content.md", "w", encoding="utf-8") as f:
-                            f.write(content)
+                summary, tree, content = process_with_gitingets(github_url)
 
-                        # Write summary to a markdown file in temp directory
-                        content_path = os.path.join(temp_dir, f"{repo_name}_content.md")
-                        with open(content_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        loader = SimpleDirectoryReader(
-                            input_dir=temp_dir,
-                        )
-                    else:    
-                        st.error('Could not find the file you uploaded, please check again...')
-                        st.stop()
-                    
-                    docs = loader.load_data()
+                # NEW: one Document per file, with the file path as metadata
+                files = split_into_files(content)
+                docs = [
+                    Document(text=text, metadata={"file_path": path})
+                    for path, text in files
+                ]
+                nodes = build_nodes(docs)
 
-                    # setup llm & embedding model
-                    llm=load_llm()
-                    embed_model = HuggingFaceEmbedding( model_name="BAAI/bge-large-en-v1.5", trust_remote_code=True)
-                    # Creating an index over loaded data
-                    Settings.embed_model = embed_model
-                    node_parser = MarkdownNodeParser()
-                    index = VectorStoreIndex.from_documents(documents=docs, transformations=[node_parser], show_progress=True)
+                # setup llm & embedding model
+                llm = load_llm()
+                embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-large-en-v1.5", trust_remote_code=True)
+                Settings.embed_model = embed_model
 
-                    # Create the query engine, where we use a cohere reranker on the fetched nodes
-                    Settings.llm = llm
-                    query_engine = index.as_query_engine(streaming=True)
+                # Creating an index over the per-file chunks
+                index = VectorStoreIndex(nodes, show_progress=True)
 
-                    # ====== Customise prompt template ======
-                    qa_prompt_tmpl_str = (
+                Settings.llm = llm
+                query_engine = index.as_query_engine(streaming=True)
+
+                # ====== Customise prompt template ======
+                qa_prompt_tmpl_str = (
                     "Context information is below.\n"
                     "---------------------\n"
                     "{context_str}\n"
@@ -95,22 +117,21 @@ with st.sidebar:
                     "Given the context information above I want you to think step by step to answer the query in a highly precise and crisp manner focused on the final answer, incase case you don't know the answer say 'I don't know!'.\n"
                     "Query: {query_str}\n"
                     "Answer: "
-                    )
-                    qa_prompt_tmpl = PromptTemplate(qa_prompt_tmpl_str)
+                )
+                qa_prompt_tmpl = PromptTemplate(qa_prompt_tmpl_str)
 
-                    query_engine.update_prompts(
-                        {"response_synthesizer:text_qa_template": qa_prompt_tmpl}
-                    )
-                    
-                    st.session_state.file_cache[file_key] = query_engine
-                else:
-                    query_engine = st.session_state.file_cache[file_key]
+                query_engine.update_prompts(
+                    {"response_synthesizer:text_qa_template": qa_prompt_tmpl}
+                )
 
-                # Inform the user that the file is processed and Display the PDF uploaded
+                st.session_state.file_cache[file_key] = query_engine
+                st.success(f"Ready to Chat! Indexed {len(files)} files ({len(nodes)} chunks).")
+            else:
+                query_engine = st.session_state.file_cache[file_key]
                 st.success("Ready to Chat!")
         except Exception as e:
             st.error(f"An error occurred: {e}")
-            st.stop()     
+            st.stop()
 
 col1, col2 = st.columns([6, 1])
 
@@ -143,22 +164,22 @@ if prompt := st.chat_input("What's up?"):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        
+
         try:
             # Get the repo name from the GitHub URL
             repo_name = github_url.split('/')[-1]
             file_key = f"{session_id}-{repo_name}"
-            
+
             # Get query engine from session state
             query_engine = st.session_state.file_cache.get(file_key)
-            
+
             if query_engine is None:
                 st.error("Please load a repository first!")
                 st.stop()
-                
+
             # Use the query engine
             response = query_engine.query(prompt)
-            
+
             # Handle streaming response
             if hasattr(response, 'response_gen'):
                 for chunk in response.response_gen:
