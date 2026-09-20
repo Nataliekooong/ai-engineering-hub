@@ -192,10 +192,19 @@ if prompt := st.chat_input("What's up?"):
                 message_placeholder.markdown(full_response)
 
             message_placeholder.markdown(full_response)
+            if hasattr(response, "source_nodes"):
+                with st.expander("Sources"):
+                    for n in response.source_nodes:
+                        score = f" (similarity {n.score:.2f})" if n.score is not None else ""
+                        st.markdown(f"**`{n.node.metadata.get('file_path', 'unknown')}`**{score}")
+                        st.code(n.node.get_content()[:500])
+                        
         except Exception as e:
             st.error(f"An error occurred while processing your query: {str(e)}")
             full_response = "Sorry, I encountered an error while processing your request."
             message_placeholder.markdown(full_response)
+
+
 
     # Add assistant response to chat history
     st.session_state.messages.append({"role": "assistant", "content": full_response})
